@@ -797,6 +797,14 @@ public:
   static constexpr bool value=decltype(check<Allocator>(0))::value;
 };
 
+template<typename T>
+void swap_atomic(std::atomic<T>& x,std::atomic<T>& y)
+{
+  auto z=x;
+  x=y;
+  y=z;
+}
+
 #if defined(_LIBCPP_SUPPRESS_DEPRECATED_POP)
 _LIBCPP_SUPPRESS_DEPRECATED_POP
 #elif defined(_STL_RESTORE_DEPRECATED_WARNING)
@@ -985,9 +993,9 @@ public:
     table_core{0,std::move(x.h()),std::move(x.pred()),al_}
   {
     if(al()==x.al()){
-      std::swap(size_,x.size_);
+      swap_atomic(size_,x.size_);
       std::swap(arrays,x.arrays);
-      std::swap(ml,x.ml);
+      swap_atomic(ml,x.ml);
     }
     else{
       reserve(x.size());
@@ -1081,9 +1089,9 @@ public:
       if(pocma||al()==x.al()){
         reserve(0);
         move_assign_if<pocma>(al(),x.al());
-        swap(size_,x.size_);
+        swap_atomic(size_,x.size_);
         swap(arrays,x.arrays);
-        swap(ml,x.ml);
+        swap_atomic(ml,x.ml);
       }
       else{
         /* noshrink: favor memory reuse over tightness */
@@ -1211,9 +1219,9 @@ public:
 
     swap(h(),x.h());
     swap(pred(),x.pred());
-    swap(size_,x.size_);
+    swap_atomic(size_,x.size_);
     swap(arrays,x.arrays);
-    swap(ml,x.ml);
+    swap_atomic(ml,x.ml);
   }
 
   void clear()noexcept
