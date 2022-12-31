@@ -1170,7 +1170,7 @@ struct map_policy
   }
 };
 
-struct ufm_concurrent
+struct ufm_concurrent_foa
 {
     boost::unordered::detail::cfoa::table<
         map_policy<std::string_view, std::size_t>,
@@ -1179,8 +1179,6 @@ struct ufm_concurrent
 
     BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
     {
-        map.reserve(Reserve);
-
         std::atomic<std::size_t> s = 0;
 
         std::thread th[ Th ];
@@ -1191,16 +1189,19 @@ struct ufm_concurrent
         {
             th[ i ] = std::thread( [this, i, m, &s]{
 
+                std::size_t s2 = 0;
+
                 std::size_t start = i * m;
                 std::size_t end = i == Th-1? words.size(): (i + 1) * m;
-                std::size_t s2 = 0;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
-                    //++map[ words[j] ];
-                    ++(map.try_emplace(words[j],0).first->second);
+                    map.try_emplace(
+                        []( auto& x, bool ){ ++x.second; },
+                        words[j], 0 );
                     ++s2;
                 }
+
                 s += s2;
             });
         }
@@ -1211,6 +1212,8 @@ struct ufm_concurrent
         }
 
         print_time( t1, "Word count", s, map.size() );
+
+        std::cout << std::endl;
     }
 
     BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
@@ -1225,20 +1228,21 @@ struct ufm_concurrent
         {
             th[ i ] = std::thread( [this, i, m, &s]{
 
+                std::size_t s2 = 0;
+
                 std::size_t start = i * m;
                 std::size_t end = i == Th-1? words.size(): (i + 1) * m;
-
-                std::size_t s2 = 0;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
                     std::string_view w2( words[j] );
                     w2.remove_prefix( 1 );
 
-                    s2 += map.find( w2 ) != map.end();
+                    map.find(w2, [&]( auto& ){ ++s2; } );
                 }
 
                 s += s2;
+
             });
         }
 
@@ -1248,36 +1252,8 @@ struct ufm_concurrent
         }
 
         print_time( t1, "Contains", s, map.size() );
-    }
-};
 
-struct ufm_concurrent_par
-{
-    boost::unordered::detail::cfoa::table<
-        map_policy<std::string_view, std::size_t>,
-        boost::hash<std::string_view>, std::equal_to<std::string_view>,
-        std::allocator<std::pair<const std::string_view,int>>> map;
-
-    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
-    {
-        map.reserve(Reserve);
-
-        std::for_each(std::execution::par, words.begin(), words.end(), [&](std::string const& word) {
-            ++(map.try_emplace(word,0).first->second);
-        });
-
-        print_time( t1, "Word count", words.size(), map.size() );
-    }
-
-    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
-    {
-        auto s = std::transform_reduce(std::execution::par, words.begin(), words.end(), std::size_t{}, std::plus<>{}, [&](std::string const& word) {
-            std::string_view w2( word );
-            w2.remove_prefix( 1 );
-            return map.find( w2 ) != map.end();
-        });
-
-        print_time( t1, "Contains", s, map.size() );
+        std::cout << std::endl;
     }
 };
 
@@ -1327,49 +1303,50 @@ int main(int argc, char** argv)
     init_words();
 
     int i=0;
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_single_threaded>( i, "boost::unordered_flat_map, single threaded" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_mutex>( i, "boost::unordered_flat_map, mutex" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_rwlock>( i, "boost::unordered_flat_map, rwlock" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_sharded_mutex>( i, "boost::unordered_flat_map, sharded mutex" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_sharded_mutex_prehashed<std::mutex>>( i, "boost::unordered_flat_map, sharded mutex, prehashed" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_sharded_mutex_prehashed<spinlock>>( i, "boost::unordered_flat_map, sharded spinlock, prehashed" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_sharded_mutex_prehashed_par<std::mutex>>( i, "boost::unordered_flat_map, sharded mutex, prehashed par" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_sharded_mutex_prehashed_par<spinlock>>( i, "boost::unordered_flat_map, sharded spinlock, prehashed par" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_sharded_rwlock>( i, "boost::unordered_flat_map, sharded rwlock" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_sharded_rwlock_prehashed>( i, "boost::unordered_flat_map, sharded rwlock, prehashed" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_sharded_isolated>( i, "boost::unordered_flat_map, sharded isolated" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
+    if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_sharded_isolated_prehashed>( i, "boost::unordered_flat_map, sharded isolated, prehashed" );
     }
-    if (numbers.empty() || numbers.contains(++i)) {
-        test<ufm_concurrent>( i, "ufm_concurrent" );
+    if (numbers.contains(++i) || numbers.empty()) {
+        test<ufm_concurrent_foa>( i, "ufm_concurrent" );
     }
+    /*
     if (numbers.empty() || numbers.contains(++i)) {
-        test<ufm_concurrent_par>( i, "ufm_concurrent_par" );
+        test<ufm_concurrent_foa_par>( i, "ufm_concurrent_par" );
     }
-
+    */
     std::cout << "---\n\n";
 
     for( auto const& x: times )
