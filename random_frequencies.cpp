@@ -2,10 +2,12 @@
 
 #include "cfoa.hpp"
 #include "cuckoohash_map.hh"
+#include "gtl/phmap.hpp"
 
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include "nanobench.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,79 +16,214 @@
 
 static constexpr auto num_elements = 100'000'000;
 static constexpr auto mask = 0xFFFFF; // 1048575
+static constexpr auto lookup_key = 123;
 
-template <typename Op> void measure(std::string_view name, Op op) {
-  auto before = std::chrono::steady_clock::now();
-  auto result = op();
-  auto after = std::chrono::steady_clock::now();
-  std::cout << std::setprecision(4)
-            << std::chrono::duration<double>(after - before).count() << " "
-            << name << " (" << result << ")" << std::endl;
+template <typename Op>
+void measure(std::string_view name, int num_threads, Op op) {
+    auto before = std::chrono::steady_clock::now();
+    auto result = op(num_threads);
+    auto after = std::chrono::steady_clock::now();
+    std::cout << std::fixed << std::setprecision(3) << std::setw(10) << std::chrono::duration<double>(after - before).count()
+              << " " << name << " " << num_threads << " (" << result << ")" << std::endl;
 }
 
-void benchSingleThreaded() {
-  measure("single threaded boost::unordered_flat_map", []() {
-    auto rng = ankerl::nanobench::Rng();
-    auto map = boost::unordered_flat_map<size_t, size_t>();
-
-    // a bunch of inserts
-    for (size_t i = 0; i < num_elements; ++i) {
-      ++map[rng() & mask];
-    }
-
-    // sum val
-    auto sum = size_t();
-    for (auto const &[key, val] : map) {
-      sum += val;
-    }
-    return sum;
-  });
+size_t calc_work(size_t total_work, int num_threads, int thread) {
+    auto end = total_work * (thread + 1) / num_threads;
+    auto start = total_work * thread / num_threads;
+    return end - start;
 }
 
-void benchCuckooHash(int num_threads) {
-  measure("single threaded libcuckoo::cuckoohash_map", [num_threads]() {
+template <typename Op>
+void parallel(int num_threads, Op op) {
     auto threads = std::vector<std::thread>();
+    threads.reserve(num_threads);
 
-    auto map = libcuckoo::cuckoohash_map<size_t, size_t>();
     for (int th = 0; th < num_threads; ++th) {
-      auto work = num_elements / num_threads;
-      if (th == num_threads - 1) {
-        // calculate remainder to make sure we do exactly the same work as
-        // everybody else
-        work = num_elements - (num_threads - 1) * work;
-      }
-      threads.emplace_back([th, work, &map] {
+        threads.emplace_back([th, op] {
+            op(th);
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+}
+
+// copied from https://rigtorp.se/spinlock/
+struct spinlock {
+    std::atomic<bool> lock_ = {0};
+
+    void lock() noexcept {
+        for (;;) {
+            // Optimistically assume the lock is free on the first try
+            if (!lock_.exchange(true, std::memory_order_acquire)) {
+                return;
+            }
+            // Wait for lock to be released without generating cache misses
+            while (lock_.load(std::memory_order_relaxed)) {
+                // Issue X86 PAUSE or ARM YIELD instruction to reduce contention between
+                // hyper-threads
+                __builtin_ia32_pause();
+            }
+        }
+    }
+
+    bool try_lock() noexcept {
+        // First do a relaxed load to check if lock is free in order to prevent
+        // unnecessary cache misses if someone does while(!try_lock())
+        return !lock_.load(std::memory_order_relaxed) && !lock_.exchange(true, std::memory_order_acquire);
+    }
+
+    void unlock() noexcept {
+        lock_.store(false, std::memory_order_release);
+    }
+};
+
+///////////////////////////////
+
+size_t doCuckooHash(int num_threads) {
+    auto map = libcuckoo::cuckoohash_map<size_t, size_t>();
+    parallel(num_threads, [&map, num_threads](int th) {
+        auto work = calc_work(num_elements, num_threads, th);
+        auto rng = ankerl::nanobench::Rng(th);
+        for (size_t i = 0; i < work; ++i) {
+            auto num = rng() & mask;
+            // see https://github.com/efficient/libcuckoo/blob/master/examples/count_freq.cc#L32
+            // If the number is already in the table, it will increment
+            // its count by one. Otherwise it will insert a new entry in
+            // the table with count one.
+            map.upsert(
+                num,
+                [](size_t& n) {
+                    ++n;
+                },
+                1);
+        }
+    });
+
+    size_t r = 0;
+    map.find_fn(lookup_key, [&](auto const& x) {
+        r = x;
+    });
+    return r;
+}
+
+template <typename Key, typename T>
+struct map_policy {
+    using key_type = Key;
+    using raw_key_type = typename std::remove_const<Key>::type;
+    using raw_mapped_type = typename std::remove_const<T>::type;
+
+    using init_type = std::pair<raw_key_type, raw_mapped_type>;
+    using moved_type = std::pair<raw_key_type&&, raw_mapped_type&&>;
+    using value_type = std::pair<const Key, T>;
+    using element_type = value_type;
+
+    static value_type& value_from(element_type& x) {
+        return x;
+    }
+
+    template <class K, class V>
+    static const raw_key_type& extract(const std::pair<K, V>& kv) {
+        return kv.first;
+    }
+
+    static moved_type move(value_type& x) {
+        return {std::move(const_cast<raw_key_type&>(x.first)), std::move(const_cast<raw_mapped_type&>(x.second))};
+    }
+
+    template <typename Allocator, typename... Args>
+    static void construct(Allocator& al, element_type* p, Args&&... args) {
+        boost::allocator_traits<Allocator>::construct(al, p, std::forward<Args>(args)...);
+    }
+
+    template <typename Allocator>
+    static void destroy(Allocator& al, element_type* p) noexcept {
+        boost::allocator_traits<Allocator>::destroy(al, p);
+    }
+};
+
+size_t doCfoa(int num_threads) {
+    auto map = boost::unordered::detail::cfoa::table<map_policy<size_t, size_t>,
+                                                     boost::hash<size_t>,
+                                                     std::equal_to<size_t>,
+                                                     std::allocator<std::pair<const size_t, size_t>>>();
+
+    parallel(num_threads, [&map, num_threads](int th) {
+        auto work = calc_work(num_elements, num_threads, th);
         auto rng = ankerl::nanobench::Rng(th);
 
         // a bunch of inserts
         for (size_t i = 0; i < work; ++i) {
-          auto num = rng() & mask;
-          // see
-          // https://github.com/efficient/libcuckoo/blob/master/examples/count_freq.cc#L32
-          // If the number is already in the table, it will increment
-          // its count by one. Otherwise it will insert a new entry in
-          // the table with count one.
-          map.upsert(
-              num, [](size_t &n) { ++n; }, 1);
+            auto num = rng() & mask;
+            map.try_emplace(
+                [](auto& x, bool) {
+                    ++x.second;
+                },
+                num,
+                0);
         }
-      });
-    }
-    for (auto &thread : threads) {
-      thread.join();
-    }
+    });
 
-    // sum val
-    auto sum = size_t();
-    auto lt = map.lock_table();
-    for (auto const &it : lt) {
-      sum += it.second;
-    }
-    return sum;
-  });
+    size_t r = 0;
+    map.find(lookup_key, [&](auto const& x) {
+        r = x.second;
+    });
+    return r;
 }
 
-int main(int argc, char **argv) {
-  benchSingleThreaded();
-  benchCuckooHash(1);
-  benchCuckooHash(std::thread::hardware_concurrency());
+size_t doIsolated(int num_threads) {
+    auto total = std::atomic<size_t>();
+    parallel(num_threads, [num_threads, &total](int th) {
+        auto map = boost::unordered_flat_map<size_t, size_t>();
+        auto work = calc_work(num_elements, num_threads, th);
+        auto rng = ankerl::nanobench::Rng(th);
+        for (size_t i = 0; i < work; ++i) {
+            auto num = rng() & mask;
+            ++map[num];
+        }
+
+        total += map[lookup_key];
+    });
+    return total.load();
+}
+
+size_t doGtl(int num_threads) {
+    auto map = gtl::parallel_flat_hash_map<size_t,
+                                           size_t,
+                                           gtl::priv::hash_default_hash<size_t>,
+                                           gtl::priv::hash_default_eq<size_t>,
+                                           std::allocator<std::pair<const size_t, size_t>>,
+                                           4,
+                                           spinlock>();
+
+    parallel(num_threads, [&map, num_threads](int th) {
+        auto work = calc_work(num_elements, num_threads, th);
+        auto rng = ankerl::nanobench::Rng(th);
+
+        // a bunch of inserts
+        for (size_t i = 0; i < work; ++i) {
+            auto num = rng() & mask;
+            map.try_emplace_l(num, [](auto& v) {
+                ++v.second;
+            });
+        }
+    });
+
+    size_t r = 0;
+    map.if_contains(lookup_key, [&](auto const& x) {
+        r = x.second;
+    });
+    return r;
+}
+
+int main(int argc, char** argv) {
+    measure("boost::unordered_flat_map isolated", 1, doIsolated);
+    measure("boost::unordered_flat_map isolated", std::thread::hardware_concurrency(), doIsolated);
+    measure("boost::unordered::detail::cfoa::table", 1, doCfoa);
+    measure("boost::unordered::detail::cfoa::table", std::thread::hardware_concurrency(), doCfoa);
+    measure("libcuckoo::cuckoohash_map", 1, doCuckooHash);
+    measure("libcuckoo::cuckoohash_map", std::thread::hardware_concurrency(), doCuckooHash);
+    measure("gtl::parallel_flat_hash_map", 1, doGtl);
+    measure("gtl::parallel_flat_hash_map", std::thread::hardware_concurrency(), doGtl);
 }
