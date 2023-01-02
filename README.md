@@ -6,3 +6,4 @@ This uses a very fast bounded random generator to fill up hashmap and extract fr
 * gtl: https://github.com/greg7mdp/gtl
 * nanobench: https://nanobench.ankerl.com/
 * cfoa: https://gist.github.com/joaquintides/949417e168ca3adc35257f93f0e57eff
+* rwspinlock: https://github.com/pdimov/parallel_hashmap_benchmark

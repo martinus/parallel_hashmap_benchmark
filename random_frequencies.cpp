@@ -204,13 +204,14 @@ size_t doCuckooHash(int num_threads) {
     return r;
 }
 
+template <size_t NumSubmaps>
 size_t doGtl(int num_threads) {
     auto map = gtl::parallel_flat_hash_map<size_t,
                                            size_t,
                                            gtl::priv::hash_default_hash<size_t>,
                                            gtl::priv::hash_default_eq<size_t>,
                                            std::allocator<std::pair<const size_t, size_t>>,
-                                           4,
+                                           NumSubmaps,
                                            spinlock>();
 
     parallel(num_threads, [&map, num_threads](int th) {
@@ -260,11 +261,13 @@ size_t doTbb(int num_threads) {
 }
 
 int main(int argc, char** argv) {
-    for (int i = 0; i <= 12; ++i) {
+    for (int i = 0; i <= 20; ++i) {
+        std::cout << i << ";";
         measure("boost::unordered_flat_map isolated", i, doIsolated);
-        measure("boost::unordered::detail::cfoa::table", i, doCfoa);
+        measure("cfoa", i, doCfoa);
         measure("libcuckoo::cuckoohash_map", i, doCuckooHash);
-        measure("gtl::parallel_flat_hash_map", i, doGtl);
+        measure("gtl::parallel_flat_hash_map<4>", i, doGtl<4>);
+        measure("gtl::parallel_flat_hash_map<6>", i, doGtl<6>);
         measure("tbb::concurrent_hash_map", i, doTbb);
         std::cout << std::endl;
     }
