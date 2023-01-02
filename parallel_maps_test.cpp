@@ -674,7 +674,7 @@ struct ufm_sharded_mutex_prehashed_par
 
     BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
     {
-        std::for_each(std::execution::par, words.begin(), words.end(), [&](std::string const& word) {
+        std::for_each(std::execution::par_unseq, words.begin(), words.end(), [&](std::string const& word) {
             prehashed x( word );
             std::size_t shard = x.h % Sh;
             auto lock = std::lock_guard( sync[ shard ].mtx );
@@ -693,7 +693,7 @@ struct ufm_sharded_mutex_prehashed_par
     BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
     {
         
-        auto s = std::transform_reduce(std::execution::par, words.begin(), words.end(), std::size_t{}, std::plus<>{}, [&](std::string const& word) {
+        auto s = std::transform_reduce(std::execution::par_unseq, words.begin(), words.end(), std::size_t{}, std::plus<>{}, [&](std::string const& word) {
             std::string_view w2( word );
             w2.remove_prefix( 1 );
 
