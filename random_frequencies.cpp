@@ -25,7 +25,7 @@ void measure(std::string_view name, int num_threads, Op op) {
     auto result = op(num_threads);
     auto after = std::chrono::steady_clock::now();
     std::cout << std::fixed << std::setprecision(3) << std::setw(10) << std::chrono::duration<double>(after - before).count()
-              << " " << name << " " << num_threads << " (" << result << ")" << std::endl;
+              << " " << name << " " << num_threads << " threads (" << result << ")" << std::endl;
 }
 
 // When splitting total_work up into multiple threads, calculate amount of work per thread.
