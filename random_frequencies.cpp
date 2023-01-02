@@ -22,11 +22,21 @@ static constexpr auto lookup_key = 123;
 // Runs op, measuring its runtime.
 template <typename Op>
 void measure(std::string_view name, int num_threads, Op op) {
+    if (0 == num_threads) {
+        std::cout << name << "; ";
+        return;
+    }
     auto before = std::chrono::steady_clock::now();
     auto result = op(num_threads);
     auto after = std::chrono::steady_clock::now();
+
+    auto t = std::chrono::duration<double>(after - before).count();
+    auto million_elements_per_second = num_elements / (t * 1e6);
+    std::cout << million_elements_per_second << ";";
+    /*
     std::cout << std::fixed << std::setprecision(3) << std::setw(10) << std::chrono::duration<double>(after - before).count()
               << " " << name << " " << num_threads << " threads (" << result << ")" << std::endl;
+              */
 }
 
 // When splitting total_work up into multiple threads, calculate amount of work per thread.
@@ -250,14 +260,12 @@ size_t doTbb(int num_threads) {
 }
 
 int main(int argc, char** argv) {
-    measure("tbb::concurrent_hash_map", 1, doTbb);
-    measure("tbb::concurrent_hash_map", std::thread::hardware_concurrency(), doTbb);
-    measure("boost::unordered_flat_map isolated", 1, doIsolated);
-    measure("boost::unordered_flat_map isolated", std::thread::hardware_concurrency(), doIsolated);
-    measure("boost::unordered::detail::cfoa::table", 1, doCfoa);
-    measure("boost::unordered::detail::cfoa::table", std::thread::hardware_concurrency(), doCfoa);
-    measure("libcuckoo::cuckoohash_map", 1, doCuckooHash);
-    measure("libcuckoo::cuckoohash_map", std::thread::hardware_concurrency(), doCuckooHash);
-    measure("gtl::parallel_flat_hash_map", 1, doGtl);
-    measure("gtl::parallel_flat_hash_map", std::thread::hardware_concurrency(), doGtl);
+    for (int i = 0; i <= 12; ++i) {
+        measure("boost::unordered_flat_map isolated", i, doIsolated);
+        measure("boost::unordered::detail::cfoa::table", i, doCfoa);
+        measure("libcuckoo::cuckoohash_map", i, doCuckooHash);
+        measure("gtl::parallel_flat_hash_map", i, doGtl);
+        measure("tbb::concurrent_hash_map", i, doTbb);
+        std::cout << std::endl;
+    }
 }
