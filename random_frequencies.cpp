@@ -1,8 +1,8 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 
 #include "cfoa.hpp"
-#include "libcuckoo/cuckoohash_map.hh"
 #include "gtl/phmap.hpp"
+#include "libcuckoo/cuckoohash_map.hh"
 
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include "nanobench.h"
@@ -18,6 +18,7 @@ static constexpr auto num_elements = 100'000'000;
 static constexpr auto mask = 0xFFFFF; // 1048575
 static constexpr auto lookup_key = 123;
 
+// Runs op, measuring its runtime.
 template <typename Op>
 void measure(std::string_view name, int num_threads, Op op) {
     auto before = std::chrono::steady_clock::now();
@@ -27,12 +28,15 @@ void measure(std::string_view name, int num_threads, Op op) {
               << " " << name << " " << num_threads << " (" << result << ")" << std::endl;
 }
 
+// When splitting total_work up into multiple threads, calculate amount of work per thread.
+// Don't just simply divide so we get exactly the correct amount of work.
 size_t calc_work(size_t total_work, int num_threads, int thread) {
     auto end = total_work * (thread + 1) / num_threads;
     auto start = total_work * thread / num_threads;
     return end - start;
 }
 
+// Creates num_threads threads that each call op(), and join() them all.
 template <typename Op>
 void parallel(int num_threads, Op op) {
     auto threads = std::vector<std::thread>();
@@ -81,31 +85,21 @@ struct spinlock {
 
 ///////////////////////////////
 
-size_t doCuckooHash(int num_threads) {
-    auto map = libcuckoo::cuckoohash_map<size_t, size_t>();
-    parallel(num_threads, [&map, num_threads](int th) {
+// each thread creates a separate map, fills it with bounded random numbers, and finally add the count of lookup_key.
+size_t doIsolated(int num_threads) {
+    auto total = std::atomic<size_t>();
+    parallel(num_threads, [num_threads, &total](int th) {
+        auto map = boost::unordered_flat_map<size_t, size_t>();
         auto work = calc_work(num_elements, num_threads, th);
         auto rng = ankerl::nanobench::Rng(th);
         for (size_t i = 0; i < work; ++i) {
             auto num = rng() & mask;
-            // see https://github.com/efficient/libcuckoo/blob/master/examples/count_freq.cc#L32
-            // If the number is already in the table, it will increment
-            // its count by one. Otherwise it will insert a new entry in
-            // the table with count one.
-            map.upsert(
-                num,
-                [](size_t& n) {
-                    ++n;
-                },
-                1);
+            ++map[num];
         }
-    });
 
-    size_t r = 0;
-    map.find_fn(lookup_key, [&](auto const& x) {
-        r = x;
+        total += map[lookup_key];
     });
-    return r;
+    return total.load();
 }
 
 template <typename Key, typename T>
@@ -172,20 +166,31 @@ size_t doCfoa(int num_threads) {
     return r;
 }
 
-size_t doIsolated(int num_threads) {
-    auto total = std::atomic<size_t>();
-    parallel(num_threads, [num_threads, &total](int th) {
-        auto map = boost::unordered_flat_map<size_t, size_t>();
+size_t doCuckooHash(int num_threads) {
+    auto map = libcuckoo::cuckoohash_map<size_t, size_t>();
+    parallel(num_threads, [&map, num_threads](int th) {
         auto work = calc_work(num_elements, num_threads, th);
         auto rng = ankerl::nanobench::Rng(th);
         for (size_t i = 0; i < work; ++i) {
             auto num = rng() & mask;
-            ++map[num];
+            // see https://github.com/efficient/libcuckoo/blob/master/examples/count_freq.cc#L32
+            // If the number is already in the table, it will increment
+            // its count by one. Otherwise it will insert a new entry in
+            // the table with count one.
+            map.upsert(
+                num,
+                [](size_t& n) {
+                    ++n;
+                },
+                1);
         }
-
-        total += map[lookup_key];
     });
-    return total.load();
+
+    size_t r = 0;
+    map.find_fn(lookup_key, [&](auto const& x) {
+        r = x;
+    });
+    return r;
 }
 
 size_t doGtl(int num_threads) {
@@ -204,9 +209,14 @@ size_t doGtl(int num_threads) {
         // a bunch of inserts
         for (size_t i = 0; i < work; ++i) {
             auto num = rng() & mask;
-            map.try_emplace_l(num, [](auto& v) {
-                ++v.second;
-            });
+            map.lazy_emplace_l(
+                num,
+                [](auto& v) {
+                    ++v.second;
+                },
+                [num](auto const& ctor) {
+                    ctor(num, 1);
+                });
         }
     });
 
