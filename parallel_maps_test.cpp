@@ -24,6 +24,7 @@
 #include <shared_mutex>
 #include <execution>
 #include "cfoa.hpp"
+#include "cuckoohash_map.hh"
 
 
 // copied from https://rigtorp.se/spinlock/
@@ -1257,6 +1258,95 @@ struct ufm_concurrent_foa
     }
 };
 
+struct ufm_cuckoohash_map
+{
+    libcuckoo::cuckoohash_map<
+        std::string_view, std::size_t,
+        boost::hash<std::string_view>, std::equal_to<std::string_view>,
+        std::allocator<std::pair<const std::string_view,int>>> map;
+
+    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    map.uprase_fn(
+                        words[j],
+                        []( auto& x){ ++x; return false; },
+                        0 );
+                    ++s2;
+                }
+
+                s += s2;
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        print_time( t1, "Word count", s, map.size() );
+
+        std::cout << std::endl;
+    }
+
+    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    std::string_view w2( words[j] );
+                    w2.remove_prefix( 1 );
+
+                    map.find_fn(w2, [&]( auto& ){ ++s2; } );
+                }
+
+                s += s2;
+
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        print_time( t1, "Contains", s, map.size() );
+
+        std::cout << std::endl;
+    }
+};
+
+
 //
 
 struct record
@@ -1287,6 +1377,8 @@ template<class Map> BOOST_NOINLINE void test( int test_number, char const* label
     rec.time_ = ( tN - t0 ) / 1ms;
     times.push_back( rec );
 }
+
+
 
 boost::unordered_flat_set<int> parse_args(int argc, char** argv) {
     auto s = boost::unordered_flat_set<int>();    
@@ -1341,6 +1433,9 @@ int main(int argc, char** argv)
     }
     if (numbers.contains(++i) || numbers.empty()) {
         test<ufm_concurrent_foa>( i, "ufm_concurrent" );
+    }
+    if (numbers.contains(++i) || numbers.empty()) {
+        test<ufm_cuckoohash_map>( i, "ufm_cuckoohash_map" );
     }
     /*
     if (numbers.empty() || numbers.contains(++i)) {
