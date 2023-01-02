@@ -3,6 +3,7 @@
 #include "cfoa.hpp"
 #include "gtl/phmap.hpp"
 #include "libcuckoo/cuckoohash_map.hh"
+#include "tbb/concurrent_hash_map.h"
 
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include "nanobench.h"
@@ -227,7 +228,30 @@ size_t doGtl(int num_threads) {
     return r;
 }
 
+size_t doTbb(int num_threads) {
+    using map_t = tbb::concurrent_hash_map<size_t, size_t>;
+    auto map = map_t();
+    parallel(num_threads, [&map, num_threads](int th) {
+        auto work = calc_work(num_elements, num_threads, th);
+        auto rng = ankerl::nanobench::Rng(th);
+
+        for (size_t i = 0; i < work; ++i) {
+            auto num = rng() & mask;
+
+            auto acc = map_t::accessor();
+            map.emplace(acc, num, 0);
+            ++acc->second;
+        }
+    });
+
+    auto acc = map_t::const_accessor();
+    map.find(acc, lookup_key);
+    return acc->second;
+}
+
 int main(int argc, char** argv) {
+    measure("tbb::concurrent_hash_map", 1, doTbb);
+    measure("tbb::concurrent_hash_map", std::thread::hardware_concurrency(), doTbb);
     measure("boost::unordered_flat_map isolated", 1, doIsolated);
     measure("boost::unordered_flat_map isolated", std::thread::hardware_concurrency(), doIsolated);
     measure("boost::unordered::detail::cfoa::table", 1, doCfoa);
