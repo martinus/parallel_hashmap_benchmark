@@ -1924,7 +1924,7 @@ public:
 
 private:
   using core=table_core<TypePolicy,Hash,Pred,Allocator>;
-  static constexpr std::size_t num_mutexes=12;
+  static constexpr std::size_t num_mutexes=16;
   //using lock_t = folly::RWSpinLock;
   //using lock_t = folly::RWTicketSpinLockT<32>;
   using lock_t = rw_spinlock;
