@@ -1,9 +1,14 @@
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/thread/shared_mutex.hpp>
+#include <tbb/spin_rw_mutex.h>
 
 #include "cfoa.hpp"
 #include "gtl/phmap.hpp"
 #include "libcuckoo/cuckoohash_map.hh"
-#include "tbb/concurrent_hash_map.h"
+#include "rw_spinlock.hpp"
+#include "oneapi/tbb/concurrent_hash_map.h"
+#include "oneapi/tbb/spin_rw_mutex.h"
+#include "folly/RWSpinLock.h"
 
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include "nanobench.h"
@@ -148,11 +153,13 @@ struct map_policy {
     }
 };
 
+template<typename Mtx>
 size_t doCfoa(int num_threads) {
     auto map = boost::unordered::detail::cfoa::table<map_policy<size_t, size_t>,
                                                      boost::hash<size_t>,
                                                      std::equal_to<size_t>,
-                                                     std::allocator<std::pair<const size_t, size_t>>>();
+                                                     std::allocator<std::pair<const size_t, size_t>>,
+                                                     Mtx>();
 
     parallel(num_threads, [&map, num_threads](int th) {
         auto work = calc_work(num_elements, num_threads, th);
@@ -263,12 +270,17 @@ size_t doTbb(int num_threads) {
 int main(int argc, char** argv) {
     for (int i = 0; i <= 20; ++i) {
         std::cout << i << ";";
-        //measure("boost::unordered_flat_map isolated", i, doIsolated);
-        measure("cfoa", i, doCfoa);
-        //measure("libcuckoo::cuckoohash_map", i, doCuckooHash);
-        //measure("gtl::parallel_flat_hash_map<4>", i, doGtl<4>);
-        //measure("gtl::parallel_flat_hash_map<6>", i, doGtl<6>);
-        //measure("tbb::concurrent_hash_map", i, doTbb);
+        measure("boost::unordered_flat_map isolated", i, doIsolated);
+        measure("cfoa<rw_spinlock>", i, doCfoa<rw_spinlock>);
+        measure("cfoa<std::shared_mutex>", i, doCfoa<std::shared_mutex>);
+        measure("cfoa<boost::shared_mutex>", i, doCfoa<boost::shared_mutex>);
+        measure("cfoa<folly::RWSpinLock>", i, doCfoa<folly::RWSpinLock>);
+        measure("cfoa<folly::RWTicketSpinLockT<32>>", i, doCfoa<folly::RWTicketSpinLockT<32>>);
+        measure("cfoa<tbb::spin_rw_mutex>", i, doCfoa<tbb::spin_rw_mutex>);
+        measure("libcuckoo::cuckoohash_map", i, doCuckooHash);
+        measure("gtl::parallel_flat_hash_map<4>", i, doGtl<4>);
+        measure("gtl::parallel_flat_hash_map<6>", i, doGtl<6>);
+        measure("tbb::concurrent_hash_map", i, doTbb);
         std::cout << std::endl;
     }
 }

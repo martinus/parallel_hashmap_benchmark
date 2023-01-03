@@ -37,12 +37,12 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <shared_mutex>
 #include <tuple>
 #include <type_traits>
 #include <utility>
-#include <shared_mutex>
-#include "folly/RWSpinLock.h"
 #include "rw_spinlock.hpp"
+#include "oneapi/tbb/spin_rw_mutex.h"
 
 #if defined(__SSE2__)||\
     defined(_M_X64)||(defined(_M_IX86_FP)&&_M_IX86_FP>=2)
@@ -501,8 +501,8 @@ inline unsigned int unchecked_countr_zero(int x)
 #endif
 }
 
-template<typename,typename,typename,typename>
-class table_core;
+template<typename,typename,typename,typename,typename>
+class table;
 
 /* table_iterator keeps two pointers:
  * 
@@ -576,7 +576,7 @@ public:
 
 private:
   template<typename,typename,bool> friend class table_iterator;
-  template<typename,typename,typename,typename> friend class table_core;
+  template<typename,typename,typename,typename,typename> friend class table;
 
   table_iterator(Group* pg,std::size_t n,const table_element_type* p_):
     pc{reinterpret_cast<unsigned char*>(const_cast<Group*>(pg))+n},
@@ -645,14 +645,6 @@ Group* dummy_groups()
     const_cast<typename Group::dummy_group_type*>(storage));
 }
 
-template<std::size_t Size>
-std::atomic<bool>* dummy_group_mutexes()
-{
-  static std::atomic<bool> mutexes[Size];
-
-  return mutexes;
-}
-
 template<typename Element,typename Group,typename SizePolicy>
 struct table_arrays
 {
@@ -672,7 +664,6 @@ struct table_arrays
 
     if(!n){
       arrays.groups=dummy_groups<group_type,size_policy::min_size()>();
-      arrays.group_mutexes=dummy_group_mutexes<size_policy::min_size()>();
     }
     else{
       arrays.elements=
@@ -693,12 +684,15 @@ struct table_arrays
 
       std::memset(arrays.groups,0,sizeof(group_type)*groups_size);
 
-      using mutex_allocator_type=allocator_rebind_t<Allocator,std::atomic<bool>>;
-      mutex_allocator_type mal=al;
-      arrays.group_mutexes=
-        boost::allocator_traits<mutex_allocator_type>::allocate(mal,groups_size);
+      using group_counter_allocator_type=
+        allocator_rebind_t<Allocator,std::atomic_size_t>;
+      group_counter_allocator_type cal=al;
+      arrays.group_counters=
+        boost::allocator_traits<group_counter_allocator_type>::allocate(
+          cal,groups_size);
       for(std::size_t n=0;n<groups_size;++n){
-        boost::allocator_traits<mutex_allocator_type>::construct(mal,arrays.group_mutexes+n);
+        boost::allocator_traits<group_counter_allocator_type>::construct(
+          cal,arrays.group_counters+n);
       }
     }
     return arrays;
@@ -716,13 +710,15 @@ struct table_arrays
         al,pointer_traits::pointer_to(*arrays.elements),
         buffer_size(arrays.groups_size_mask+1));
 
-      using mutex_allocator_type=allocator_rebind_t<Allocator,std::atomic<bool>>;
-      mutex_allocator_type mal=al;
+      using group_counter_allocator_type=
+        allocator_rebind_t<Allocator,std::atomic_size_t>;
+      group_counter_allocator_type cal=al;
       for(std::size_t n=0;n<arrays.groups_size_mask+1;++n){
-        boost::allocator_traits<mutex_allocator_type>::destroy(mal,arrays.group_mutexes+n);
+        boost::allocator_traits<group_counter_allocator_type>::destroy(
+          cal,arrays.group_counters+n);
       }
-      boost::allocator_traits<mutex_allocator_type>::deallocate(
-        mal,arrays.group_mutexes,arrays.groups_size_mask+1);
+      boost::allocator_traits<group_counter_allocator_type>::deallocate(
+        cal,arrays.group_counters,arrays.groups_size_mask+1);
     }
   }
 
@@ -742,11 +738,11 @@ struct table_arrays
     return (buffer_bytes+sizeof(element_type)-1)/sizeof(element_type);
   }
 
-  std::size_t       groups_size_index;
-  std::size_t       groups_size_mask;
-  group_type        *groups;
-  element_type      *elements;
-  std::atomic<bool> *group_mutexes;
+  std::size_t         groups_size_index;
+  std::size_t         groups_size_mask;
+  group_type         *groups;
+  element_type       *elements;
+  std::atomic_size_t *group_counters;
 };
 
 struct if_constexpr_void_else{void operator()()const{}};
@@ -931,14 +927,17 @@ _STL_RESTORE_DEPRECATED_WARNING
  */
 constexpr static float const mlf = 0.875f;
 
-template<typename TypePolicy,typename Hash,typename Pred,typename Allocator>
+template<
+  typename TypePolicy,typename Hash,typename Pred,typename Allocator,
+  typename Mutex=rw_spinlock
+>
 class 
 
 #if defined(_MSC_VER)&&_MSC_FULL_VER>=190023918
 __declspec(empty_bases) /* activate EBO with multiple inheritance */
 #endif
 
-table_core:empty_value<Hash,0>,empty_value<Pred,1>,empty_value<Allocator,2>
+table:empty_value<Hash,0>,empty_value<Pred,1>,empty_value<Allocator,2>
 {
   using hash_base=empty_value<Hash,0>;
   using pred_base=empty_value<Pred,1>;
@@ -980,18 +979,18 @@ public:
     table_iterator<type_policy,group_type,false>,
     const_iterator>::type;
 
-  table_core(
-    std::size_t n=0,const Hash& h_=Hash(),const Pred& pred_=Pred(),
+  table(
+    std::size_t n=354000,const Hash& h_=Hash(),const Pred& pred_=Pred(),
     const Allocator& al_=Allocator()):
     hash_base{empty_init,h_},pred_base{empty_init,pred_},
     allocator_base{empty_init,al_},size_{0},arrays(new_arrays(n)),
     ml{initial_max_load()}
     {}
 
-  table_core(const table_core& x):
-    table_core{x,alloc_traits::select_on_container_copy_construction(x.al())}{}
+  table(const table& x):
+    table{x,alloc_traits::select_on_container_copy_construction(x.al())}{}
 
-  table_core(table_core&& x)
+  table(table&& x)
     noexcept(
       std::is_nothrow_move_constructible<Hash>::value&&
       std::is_nothrow_move_constructible<Pred>::value&&
@@ -1006,14 +1005,14 @@ public:
     x.ml=x.initial_max_load();
   }
 
-  table_core(const table_core& x,const Allocator& al_):
-    table_core{std::size_t(std::ceil(float(x.size())/mlf)),x.h(),x.pred(),al_}
+  table(const table& x,const Allocator& al_):
+    table{std::size_t(std::ceil(float(x.size())/mlf)),x.h(),x.pred(),al_}
   {
     copy_elements_from(x);
   }
 
-  table_core(table_core&& x,const Allocator& al_):
-    table_core{0,std::move(x.h()),std::move(x.pred()),al_}
+  table(table&& x,const Allocator& al_):
+    table{0,std::move(x.h()),std::move(x.pred()),al_}
   {
     if(al()==x.al()){
       swap_atomic(size_,x.size_);
@@ -1034,7 +1033,7 @@ public:
     }
   }
 
-  ~table_core()noexcept
+  ~table()noexcept
   {
     for_all_elements([this](element_type* p){
       destroy_element(p);
@@ -1042,7 +1041,7 @@ public:
     delete_arrays(arrays);
   }
 
-  table_core& operator=(const table_core& x)
+  table& operator=(const table& x)
   {
     BOOST_UNORDERED_STATIC_ASSERT_HASH_PRED(Hash, Pred)
 
@@ -1082,7 +1081,7 @@ public:
 #pragma warning(disable:4127) /* conditional expression is constant */
 #endif
 
-  table_core& operator=(table_core&& x)
+  table& operator=(table&& x)
     noexcept(
       alloc_traits::propagate_on_container_move_assignment::value||
       alloc_traits::is_always_equal::value)
@@ -1147,9 +1146,9 @@ public:
   }
 
   const_iterator begin()const noexcept
-                   {return const_cast<table_core*>(this)->begin();}
+                   {return const_cast<table*>(this)->begin();}
   iterator       end()noexcept{return {};}
-  const_iterator end()const noexcept{return const_cast<table_core*>(this)->end();}
+  const_iterator end()const noexcept{return const_cast<table*>(this)->end();}
   const_iterator cbegin()const noexcept{return begin();}
   const_iterator cend()const noexcept{return end();}
 
@@ -1171,10 +1170,20 @@ public:
   }
 
   template<typename F,typename Key,typename... Args>
-  BOOST_FORCEINLINE bool try_emplace(F f,Key&& x,Args&&... args)
+  BOOST_FORCEINLINE void try_emplace(F f,Key&& x,Args&&... args)
   {
-    return emplace_impl(
-      f,try_emplace_args_t{},std::forward<Key>(x),std::forward<Args>(args)...);
+    for(;;){
+      std::size_t n;
+      {
+        auto lck=shared_access();
+        n=capacity();
+        if(emplace_impl(
+          f,try_emplace_args_t{},std::forward<Key>(x),std::forward<Args>(args)...))return;
+      }
+
+      auto lck=exclusive_access();
+      if(capacity()<=n)rehash(n+1);
+    }
   }
 
   BOOST_FORCEINLINE std::pair<iterator,bool>
@@ -1221,7 +1230,7 @@ public:
     else return 0;
   }
 
-  void swap(table_core& x)
+  void swap(table& x)
     noexcept(
       alloc_traits::propagate_on_container_swap::value||
       alloc_traits::is_always_equal::value)
@@ -1269,7 +1278,7 @@ public:
 
   // TODO: should we accept different allocator too?
   template<typename Hash2,typename Pred2>
-  void merge(table_core<TypePolicy,Hash2,Pred2,Allocator>& x)
+  void merge(table<TypePolicy,Hash2,Pred2,Allocator>& x)
   {
     x.for_all_elements([&,this](group_type* pg,unsigned int n,element_type* p){
       if(emplace_impl(type_policy::move(*p)).second){
@@ -1279,7 +1288,7 @@ public:
   }
 
   template<typename Hash2,typename Pred2>
-  void merge(table_core<TypePolicy,Hash2,Pred2,Allocator>&& x){merge(x);}
+  void merge(table<TypePolicy,Hash2,Pred2,Allocator>&& x){merge(x);}
 
   hasher hash_function()const{return h();}
   key_equal key_eq()const{return pred();}
@@ -1287,6 +1296,7 @@ public:
   template<typename Key,typename F>
   BOOST_FORCEINLINE bool find(const Key& x,F f)
   {
+    auto lck=shared_access();
     auto hash=hash_for(x);
     return find_impl(x,f,position_for(hash),hash);
   }
@@ -1294,7 +1304,7 @@ public:
   template<typename Key,typename F>
   BOOST_FORCEINLINE bool find(const Key& x,F f)const
   {
-    return const_cast<table_core*>(this)->find(x,f);
+    return const_cast<table*>(this)->find(x,f);
   }
 
   std::size_t capacity()const noexcept
@@ -1327,13 +1337,13 @@ public:
   }
 
   template<typename Predicate>
-  friend std::size_t erase_if(table_core& x,Predicate pr)
+  friend std::size_t erase_if(table& x,Predicate pr)
   {
     return x.erase_if_impl(pr);
   }
 
 private:
-  template<typename,typename,typename,typename> friend class table_core;
+  template<typename,typename,typename,typename,typename> friend class table;
   using element_type=typename type_policy::element_type;
   using element_allocator_type=allocator_rebind_t<Allocator,element_type>;
   using arrays_type=table_arrays<element_type,group_type,size_policy>;
@@ -1341,7 +1351,7 @@ private:
   struct clear_on_exit
   {
     ~clear_on_exit(){x.clear();}
-    table_core& x;
+    table& x;
   };
 
   Hash&            h(){return hash_base::get();}
@@ -1408,11 +1418,11 @@ private:
   struct destroy_element_on_exit
   {
     ~destroy_element_on_exit(){this_->destroy_element(p);}
-    table_core        *this_;
+    table        *this_;
     element_type *p;
   };
 
-  void copy_elements_from(const table_core& x)
+  void copy_elements_from(const table& x)
   {
     BOOST_ASSERT(empty());
     BOOST_ASSERT(this!=std::addressof(x));
@@ -1426,7 +1436,7 @@ private:
     }
   }
 
-  void fast_copy_elements_from(const table_core& x)
+  void fast_copy_elements_from(const table& x)
   {
     if(arrays.elements){
       copy_elements_array_from(x);
@@ -1437,7 +1447,7 @@ private:
     }
   }
 
-  void copy_elements_array_from(const table_core& x)
+  void copy_elements_array_from(const table& x)
   {
     copy_elements_array_from(
       x,
@@ -1457,7 +1467,7 @@ private:
     );
   }
 
-  void copy_elements_array_from(const table_core& x,std::true_type /* -> memcpy */)
+  void copy_elements_array_from(const table& x,std::true_type /* -> memcpy */)
   {
     /* reinterpret_cast: GCC may complain about element_type not being
      * trivially copy-assignable when we're relying on trivial copy
@@ -1469,7 +1479,7 @@ private:
       x.capacity()*sizeof(element_type));
   }
 
-  void copy_elements_array_from(const table_core& x,std::false_type /* -> manual */)
+  void copy_elements_array_from(const table& x,std::false_type /* -> manual */)
   {
     std::size_t num_constructed=0;
     BOOST_TRY{
@@ -1620,18 +1630,40 @@ private:
     const auto       &k=key_from(std::forward<Args>(args)...);
     auto             hash=hash_for(k);
     auto             pos0=position_for(hash);
-    lock             lck(arrays.group_mutexes[pos0]);
 
-    if(find_impl(
-      k,[&](value_type& x){f(x,false);},pos0,hash))return true;
+    for(;;){
+    startover:;
+      std::size_t group_counter=arrays.group_counters[pos0];
 
-    if(BOOST_LIKELY(size_<ml)){
-      auto it=unchecked_emplace_at(pos0,hash,std::forward<Args>(args)...);
-      f(*it,true);
-      return true;
+      if(find_impl(
+        k,[&](value_type& x){f(x,false);},pos0,hash))return true;
+
+      if(BOOST_LIKELY(size_<ml)){
+        for(prober pb(pos0);;pb.next(arrays.groups_size_mask)){
+          auto pos=pb.get();
+          auto pg=arrays.groups+pos;
+          for(;;){
+            auto mask=pg->match_available();
+            if(BOOST_UNLIKELY(mask==0))break;
+            auto n=unchecked_countr_zero(mask);
+            auto c=pg->acquire(n);
+            if(BOOST_UNLIKELY(c!=0))continue;
+            if(BOOST_UNLIKELY(++arrays.group_counters[pos0]!=group_counter+1)){
+              /* some other thread inserted from p0, need to start over */
+              goto startover;
+            }
+            auto p=arrays.elements+pos*N+n;
+            construct_element(p,std::forward<Args>(args)...);
+            c=group_type::get_reduced_hash(hash);
+            ++size_;
+            f(*p,true);
+            return true;
+          }
+          pg->mark_overflow(hash);
+        }
+      }
+      else return false;
     }
-
-    return false;
   }
 
   static std::size_t capacity_for(std::size_t n)
@@ -1883,79 +1915,43 @@ private:
   std::atomic<std::size_t> size_;
   arrays_type              arrays;
   std::atomic<std::size_t> ml;
-};
 
-template<typename TypePolicy,typename Hash,typename Pred,typename Allocator>
-class table
-{
-public:
-  auto size()const noexcept{return c.size();}
-
-  template<typename Key,typename F>
-  BOOST_FORCEINLINE auto find(const Key& x,F f)
+  using mutex_type=Mutex;
+  static constexpr std::size_t num_mutexes=128;
+  struct aligned_mutex
   {
-    auto lck=access();
-    c.find(x,f);
-  }
-
-  template<typename Key,typename F>
-  BOOST_FORCEINLINE auto find(const Key& x,F f)const
-  {
-    auto lck=access();
-    c.find(x,f);
-  }
-
-  template<typename F,typename Key,typename... Args>
-  BOOST_FORCEINLINE void try_emplace(F f,Key&& x,Args&&... args)
-  {
-    for(;;){
-      std::size_t n;
-      {
-        auto lck=access();
-        n=c.capacity();
-        if(c.try_emplace(
-          f,std::forward<Key>(x),std::forward<Args>(args)...))return;
-      }
-
-      auto lck=exclusive_access();
-      if(c.capacity()<=n)c.rehash(n+1);
-    }
-  }
-
-private:
-  using core=table_core<TypePolicy,Hash,Pred,Allocator>;
-  static constexpr std::size_t num_mutexes=16;
-  //using lock_t = folly::RWSpinLock;
-  //using lock_t = folly::RWTicketSpinLockT<32>;
-  using lock_t = rw_spinlock;
-  struct mutex
-  {
-    alignas(64) mutable lock_t mtx;
+    alignas(64) mutable mutex_type mtx;
   };
 
-  std::shared_lock<lock_t> access()const
+  std::shared_lock<mutex_type> shared_access()const
   {
     thread_local auto id=(++thread_counter)%num_mutexes;
 
-    return std::shared_lock<lock_t>{mutexes[id].mtx};
+    return std::shared_lock<mutex_type>{mutexes[id].mtx};
   }
+
+  struct exclusive_access_struct
+  {
+    exclusive_access_struct(const aligned_mutex* mutexes_):mutexes{mutexes_}
+    {
+      for(int i=0;i<num_mutexes;)mutexes[i++].mtx.lock();
+    }
+
+    ~exclusive_access_struct()
+    {
+      for(int i=num_mutexes;i>0;)mutexes[--i].mtx.unlock();
+    }
+
+    const aligned_mutex* mutexes;
+  };
 
   auto exclusive_access()const
   {
-    return std::apply(
-      [](auto&... mtxs)
-      {
-        return std::array<std::lock_guard<lock_t>,num_mutexes>
-        {
-          std::lock_guard<lock_t>{mtxs.mtx}...
-        };
-      },
-      mutexes);
+    return exclusive_access_struct(mutexes.data());
   }
 
-  mutable std::atomic_uint      thread_counter=0;
-  std::array<mutex,num_mutexes> mutexes;
-  core                          c;
+  mutable std::atomic_uint              thread_counter=0;
+  std::array<aligned_mutex,num_mutexes> mutexes;
 };
 
 #if BOOST_WORKAROUND(BOOST_MSVC,<=1900)
