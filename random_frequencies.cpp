@@ -1,14 +1,14 @@
-#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/thread/shared_mutex.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <tbb/spin_rw_mutex.h>
 
 #include "cfoa.hpp"
+#include "folly/RWSpinLock.h"
 #include "gtl/phmap.hpp"
 #include "libcuckoo/cuckoohash_map.hh"
-#include "rw_spinlock.hpp"
 #include "oneapi/tbb/concurrent_hash_map.h"
 #include "oneapi/tbb/spin_rw_mutex.h"
-#include "folly/RWSpinLock.h"
+#include "rw_spinlock.hpp"
 
 #define ANKERL_NANOBENCH_IMPLEMENT
 #include "nanobench.h"
@@ -23,6 +23,7 @@
 static constexpr auto num_elements = 100'000'000;
 static constexpr auto mask = 0xFFFFF; // 1048575
 static constexpr auto lookup_key = 123;
+static constexpr auto num_benchmark_runs_for_median = 9;
 
 // Runs op, measuring its runtime.
 template <typename Op>
@@ -31,17 +32,22 @@ void measure(std::string_view name, int num_threads, Op op) {
         std::cout << name << "; ";
         return;
     }
-    auto before = std::chrono::steady_clock::now();
-    auto result = op(num_threads);
-    auto after = std::chrono::steady_clock::now();
 
-    auto t = std::chrono::duration<double>(after - before).count();
+    auto durations = std::vector<double>(num_benchmark_runs_for_median);
+    for (auto& dur : durations) {
+        auto before = std::chrono::steady_clock::now();
+        auto result = op(num_threads);
+        auto after = std::chrono::steady_clock::now();
+        if (0 == result) {
+            throw std::runtime_error("somethig wrong in " + std::string(name));
+        }
+        dur = std::chrono::duration<double>(after - before).count();
+    }
+    std::sort(durations.begin(), durations.end());
+    auto t = durations[durations.size() / 2];
     auto million_elements_per_second = num_elements / (t * 1e6);
     std::cout << million_elements_per_second << ";";
-    /*
-    std::cout << std::fixed << std::setprecision(3) << std::setw(10) << std::chrono::duration<double>(after - before).count()
-              << " " << name << " " << num_threads << " threads (" << result << ")" << std::endl;
-              */
+    std::cout.flush();
 }
 
 // When splitting total_work up into multiple threads, calculate amount of work per thread.
@@ -153,7 +159,7 @@ struct map_policy {
     }
 };
 
-template<typename Mtx>
+template <typename Mtx>
 size_t doCfoa(int num_threads) {
     auto map = boost::unordered::detail::cfoa::table<map_policy<size_t, size_t>,
                                                      boost::hash<size_t>,
