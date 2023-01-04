@@ -22,8 +22,26 @@
 
 static constexpr auto num_elements = 100'000'000;
 static constexpr auto mask = 0xFFFFF; // 1048575
-static constexpr auto lookup_key = 123;
+static constexpr auto lookup_key = 0;
 static constexpr auto num_benchmark_runs_for_median = 9;
+
+// uniformly distributed number in range [0, mask]
+#if 0
+
+inline size_t calc_index(ankerl::nanobench::Rng& rng) {
+    return rng() & mask;
+}
+
+#else
+
+// biased numbers in range
+inline size_t calc_index(ankerl::nanobench::Rng& rng) {
+    auto n = rng();
+    auto shift = (n & 15) + 48;
+    return n >> shift;
+}
+
+#endif
 
 // Runs op, measuring its runtime.
 template <typename Op>
@@ -41,10 +59,13 @@ void measure(std::string_view name, int num_threads, Op op) {
         if (0 == result) {
             throw std::runtime_error("somethig wrong in " + std::string(name));
         }
+        // std::cout << "(r=" << result << ")";
         dur = std::chrono::duration<double>(after - before).count();
     }
     std::sort(durations.begin(), durations.end());
-    auto t = durations[durations.size() / 2];
+    auto mid1 = (durations.size() - 1) / 2;
+    auto mid2 = (durations.size()) / 2;
+    auto t = (durations[mid1] + durations[mid2]) / 2;
     auto million_elements_per_second = num_elements / (t * 1e6);
     std::cout << million_elements_per_second << ";";
     std::cout.flush();
@@ -115,8 +136,7 @@ size_t doIsolated(int num_threads) {
         auto work = calc_work(num_elements, num_threads, th);
         auto rng = ankerl::nanobench::Rng(th);
         for (size_t i = 0; i < work; ++i) {
-            auto num = rng() & mask;
-            ++map[num];
+            ++map[calc_index(rng)];
         }
 
         total += map[lookup_key];
@@ -173,12 +193,11 @@ size_t doCfoa(int num_threads) {
 
         // a bunch of inserts
         for (size_t i = 0; i < work; ++i) {
-            auto num = rng() & mask;
             map.try_emplace(
                 [](auto& x, bool) {
                     ++x.second;
                 },
-                num,
+                calc_index(rng),
                 0);
         }
     });
@@ -196,13 +215,12 @@ size_t doCuckooHash(int num_threads) {
         auto work = calc_work(num_elements, num_threads, th);
         auto rng = ankerl::nanobench::Rng(th);
         for (size_t i = 0; i < work; ++i) {
-            auto num = rng() & mask;
             // see https://github.com/efficient/libcuckoo/blob/master/examples/count_freq.cc#L32
             // If the number is already in the table, it will increment
             // its count by one. Otherwise it will insert a new entry in
             // the table with count one.
             map.upsert(
-                num,
+                calc_index(rng),
                 [](size_t& n) {
                     ++n;
                 },
@@ -233,7 +251,7 @@ size_t doGtl(int num_threads) {
 
         // a bunch of inserts
         for (size_t i = 0; i < work; ++i) {
-            auto num = rng() & mask;
+            auto num = calc_index(rng);
             map.lazy_emplace_l(
                 num,
                 [](auto& v) {
@@ -260,10 +278,8 @@ size_t doTbb(int num_threads) {
         auto rng = ankerl::nanobench::Rng(th);
 
         for (size_t i = 0; i < work; ++i) {
-            auto num = rng() & mask;
-
             auto acc = map_t::accessor();
-            map.emplace(acc, num, 0);
+            map.emplace(acc, calc_index(rng), 0);
             ++acc->second;
         }
     });
