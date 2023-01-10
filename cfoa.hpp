@@ -37,12 +37,14 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include "rw_spinlock.hpp"
 #include "oneapi/tbb/spin_rw_mutex.h"
+
 
 #if defined(__SSE2__)||\
     defined(_M_X64)||(defined(_M_IX86_FP)&&_M_IX86_FP>=2)
@@ -108,53 +110,6 @@ static const std::size_t default_bucket_count = 0;
  *     operations.
  */
 
-/* copied from https://rigtorp.se/spinlock/ */
-// (not any longer)
-
-template<typename Atomic,typename Atomic::value_type Locked=1>
-class lock
-{
-public:
-  using value_type=typename Atomic::value_type;
-
-  lock(Atomic& a_):a{a_}
-  {
-    constexpr int spin_count = 32768;
-
-    for(;;)
-    {
-      if( (x=a.exchange(Locked,std::memory_order_acquire)) != Locked ) return;
-
-      bool locked = true;
-
-      for( int k = 0; k < spin_count; ++k )
-      {
-        if( a.load( std::memory_order_relaxed ) != Locked )
-        {
-          locked = false;
-          break;
-        }
-
-        boost::detail::sp_thread_pause();
-      }
-
-      if( locked )
-      {
-        boost::detail::sp_thread_sleep();
-      }
-    }
-  }
-
-  ~lock(){a.store(x,std::memory_order_release);}
-
-  operator const value_type&()const{return x;}
-  lock& operator=(const value_type& x_){x=x_;return *this;}
-
-private:
-  Atomic&    a;
-  value_type x;
-};
-
 /* group15 controls metadata information of a group of N=15 element slots.
  * The 16B metadata word is organized as follows (LSB depicted rightmost):
  *
@@ -207,8 +162,9 @@ struct group15
 
   struct dummy_group_type
   {
-    alignas(16) std::atomic<unsigned char> storage[N+1]=
+    alignas(16) unsigned char storage[N+1]=
       {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    boost::uint32_t mtx_storage=0,counter_storage=0;
   };
 
   inline void initialize()
@@ -217,24 +173,31 @@ struct group15
       reinterpret_cast<__m128i*>(m),_mm_setzero_si128());
   }
 
-  inline auto acquire(std::size_t pos)
+  inline auto shared_access()
   {
-    BOOST_ASSERT(pos<N);
-    return lock<std::atomic<unsigned char>,locked_>(at(pos));
+    return std::shared_lock<rw_spinlock>(mtx);
   }
 
-  static inline unsigned char get_reduced_hash(std::size_t hash)
+  inline auto exclusive_access()
   {
-    return reduced_hash(hash);
+    return std::scoped_lock<rw_spinlock>(mtx);
   }
 
-#if 0
+  inline std::atomic_uchar& at(std::size_t pos)
+  {
+    return m[pos];
+  }
+
+  inline const std::atomic_uchar& at(std::size_t pos)const
+  {
+    return m[pos];
+  }
+
   inline void set(std::size_t pos,std::size_t hash)
   {
     BOOST_ASSERT(pos<N);
     at(pos)=reduced_hash(hash);
   }
-#endif
 
   inline void reset(std::size_t pos)
   {
@@ -250,12 +213,9 @@ struct group15
   inline int match(std::size_t hash)const
   {
     auto w=_mm_load_si128(reinterpret_cast<const __m128i*>(m));
-    std::atomic_thread_fence(std::memory_order_acquire); // TODO WHY O WHY
-    //_mm_lfence();
-    //_mm_mfence();
+    //std::atomic_thread_fence(std::memory_order_acquire);
     return
-      (_mm_movemask_epi8(_mm_cmpeq_epi8(w,_mm_set1_epi32(match_word(hash))))|
-       _mm_movemask_epi8(_mm_cmpeq_epi8(w,_mm_set1_epi8(locked_))))&0x7FFF;
+      _mm_movemask_epi8(_mm_cmpeq_epi8(w,_mm_set1_epi32(match_word(hash))))&0x7FFF;
   }
 
   inline bool is_not_overflowed(std::size_t hash)const
@@ -279,10 +239,10 @@ struct group15
 
   inline int match_available()const
   {
+    auto w=_mm_load_si128(reinterpret_cast<const __m128i*>(m));
+    //std::atomic_thread_fence(std::memory_order_acquire);
     return _mm_movemask_epi8(
-      _mm_cmpeq_epi8(
-        _mm_load_si128(reinterpret_cast<const __m128i*>(m)),
-        _mm_setzero_si128()))&0x7FFF;
+      _mm_cmpeq_epi8(w,_mm_setzero_si128()))&0x7FFF;
   }
 
   inline int match_occupied()const
@@ -292,7 +252,7 @@ struct group15
 
 private:
   static constexpr unsigned char available_=0,
-                                 locked_=1;
+                                 sentinel_=1;
 
   inline static int match_word(std::size_t hash)
   {
@@ -340,27 +300,20 @@ private:
     return narrow_cast<unsigned char>(match_word(hash));
   }
 
-  inline std::atomic<unsigned char>& at(std::size_t pos)
-  {
-    return m[pos];
-  }
-
-  inline const std::atomic<unsigned char>& at(std::size_t pos)const
-  {
-    return m[pos];
-  }
-
-  inline std::atomic<unsigned char>& overflow()
+  inline std::atomic_uchar& overflow()
   {
     return at(N);
   }
 
-  inline const std::atomic<unsigned char>& overflow()const
+  inline const std::atomic_uchar& overflow()const
   {
     return at(N);
   }
 
-  alignas(16) std::atomic<unsigned char> m[16];
+  alignas(16) std::atomic_uchar m[16];
+  rw_spinlock                   mtx;
+public:
+  std::atomic_uint32_t          counter;
 };
 
 #elif defined(BOOST_UNORDERED_LITTLE_ENDIAN_NEON)
@@ -660,7 +613,11 @@ struct table_arrays
 
     auto         groups_size_index=size_index_for<group_type,size_policy>(n);
     auto         groups_size=size_policy::size(groups_size_index);
+#if EMBEDDED_COUNTER
+    table_arrays arrays{groups_size_index,groups_size-1,nullptr,nullptr};
+#else
     table_arrays arrays{groups_size_index,groups_size-1,nullptr,nullptr,nullptr};
+#endif
 
     if(!n){
       arrays.groups=dummy_groups<group_type,size_policy::min_size()>();
@@ -684,8 +641,9 @@ struct table_arrays
 
       std::memset(arrays.groups,0,sizeof(group_type)*groups_size);
 
+#if !EMBEDDED_COUNTER
       using group_counter_allocator_type=
-        allocator_rebind_t<Allocator,std::atomic_size_t>;
+        allocator_rebind_t<Allocator,std::atomic_uint16_t>;
       group_counter_allocator_type cal=al;
       arrays.group_counters=
         boost::allocator_traits<group_counter_allocator_type>::allocate(
@@ -694,6 +652,7 @@ struct table_arrays
         boost::allocator_traits<group_counter_allocator_type>::construct(
           cal,arrays.group_counters+n);
       }
+#endif
     }
     return arrays;
   }
@@ -710,8 +669,9 @@ struct table_arrays
         al,pointer_traits::pointer_to(*arrays.elements),
         buffer_size(arrays.groups_size_mask+1));
 
+#if !EMBEDDED_COUNTER
       using group_counter_allocator_type=
-        allocator_rebind_t<Allocator,std::atomic_size_t>;
+        allocator_rebind_t<Allocator,std::atomic_uint16_t>;
       group_counter_allocator_type cal=al;
       for(std::size_t n=0;n<arrays.groups_size_mask+1;++n){
         boost::allocator_traits<group_counter_allocator_type>::destroy(
@@ -719,6 +679,7 @@ struct table_arrays
       }
       boost::allocator_traits<group_counter_allocator_type>::deallocate(
         cal,arrays.group_counters,arrays.groups_size_mask+1);
+#endif
     }
   }
 
@@ -738,11 +699,14 @@ struct table_arrays
     return (buffer_bytes+sizeof(element_type)-1)/sizeof(element_type);
   }
 
-  std::size_t         groups_size_index;
-  std::size_t         groups_size_mask;
-  group_type         *groups;
-  element_type       *elements;
-  std::atomic_size_t *group_counters;
+  std::size_t           groups_size_index;
+  std::size_t           groups_size_mask;
+  group_type           *groups;
+  element_type         *elements;
+
+#if !EMBEDDED_COUNTER
+  std::atomic_uint16_t *group_counters;
+#endif
 };
 
 struct if_constexpr_void_else{void operator()()const{}};
@@ -1600,12 +1564,12 @@ private:
       if(mask){
         auto p=arrays.elements+pos*N;
         prefetch_elements(p);
+        auto lck=pg->shared_access();
         do{
           auto n=unchecked_countr_zero(mask);
-          auto c=pg->acquire(n);
-          if(BOOST_LIKELY(
-            c!=0&&
-            bool(pred()(x,key_from(p[n]))))){
+          if(
+            pg->at(n)!=0&&
+            BOOST_LIKELY(bool(pred()(x,key_from(p[n]))))){
             f(p[n]);
             return true;
           }
@@ -1633,8 +1597,7 @@ private:
 
     for(;;){
     startover:;
-      std::size_t group_counter=arrays.group_counters[pos0];
-
+      boost::uint32_t group_counter=arrays.groups[pos0].counter;
       if(find_impl(
         k,[&](value_type& x){f(x,false);},pos0,hash))return true;
 
@@ -1642,22 +1605,26 @@ private:
         for(prober pb(pos0);;pb.next(arrays.groups_size_mask)){
           auto pos=pb.get();
           auto pg=arrays.groups+pos;
-          for(;;){
-            auto mask=pg->match_available();
-            if(BOOST_UNLIKELY(mask==0))break;
-            auto n=unchecked_countr_zero(mask);
-            auto c=pg->acquire(n);
-            if(BOOST_UNLIKELY(c!=0))continue;
-            if(BOOST_UNLIKELY(++arrays.group_counters[pos0]!=group_counter+1)){
-              /* some other thread inserted from p0, need to start over */
-              goto startover;
-            }
-            auto p=arrays.elements+pos*N+n;
-            construct_element(p,std::forward<Args>(args)...);
-            c=group_type::get_reduced_hash(hash);
-            ++size_;
-            f(*p,true);
-            return true;
+          auto mask=pg->match_available();
+          if(BOOST_LIKELY(mask!=0)){
+            auto lck=pg->exclusive_access();
+            do{
+              auto n=unchecked_countr_zero(mask);
+              if(pg->at(n)==0){
+                pg->set(n,hash);
+                if(BOOST_UNLIKELY(arrays.groups[pos0].counter++!=group_counter)){
+                  /* some other thread inserted from p0, need to start over */
+                  pg->reset(n);
+                  goto startover;
+                }
+                auto p=arrays.elements+pos*N+n;
+                construct_element(p,std::forward<Args>(args)...);
+                ++size_;
+                f(*p,true);
+                return true;
+              }
+              mask&=mask-1;
+            }while(mask);
           }
           pg->mark_overflow(hash);
         }
@@ -1837,12 +1804,9 @@ private:
         auto mask=pg->match_available();
         if(BOOST_UNLIKELY(mask==0))break;
         auto n=unchecked_countr_zero(mask);
-        auto c=pg->acquire(n);
-        if(BOOST_UNLIKELY(c!=0))continue;
         auto p=arrays_.elements+pos*N+n;
         construct_element(p,std::forward<Args>(args)...);
-        //pg->set(n,hash);
-        c=group_type::get_reduced_hash(hash);
+        pg->set(n,hash);
         return {pg,n,p};
       }
       pg->mark_overflow(hash);
@@ -1925,7 +1889,8 @@ private:
 
   std::shared_lock<mutex_type> shared_access()const
   {
-    thread_local auto id=(++thread_counter)%num_mutexes;
+    thread_local auto       id=(++thread_counter)%num_mutexes;
+    //thread_local auto id=std::hash<std::thread::id>()(std::this_thread::get_id())%num_mutexes;
 
     return std::shared_lock<mutex_type>{mutexes[id].mtx};
   }
