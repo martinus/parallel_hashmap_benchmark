@@ -4,8 +4,8 @@
 #include <limits>
 #include <vector>
 
-// Source: https://github.com/bitcoin/bitcoin/blob/master/src/memusage.h#L41-L61
 static inline auto malloc_usage(size_t alloc) -> size_t {
+    // Source: https://github.com/bitcoin/bitcoin/blob/master/src/memusage.h#L41-L61
     static_assert(sizeof(void*) == 8 || sizeof(void*) == 4);
 
     // Measured on libc6 2.19 on Linux.
